@@ -124,8 +124,11 @@ type symmetricState struct {
 	ck   []byte
 	h    []byte
 
-	prevCK []byte
-	prevH  []byte
+	prevCK   []byte
+	prevH    []byte
+	prevK    [32]byte
+	prevN    uint64
+	prevHasK bool
 }
 
 func (s *symmetricState) InitializeSymmetric(handshakeName []byte) {
@@ -216,6 +219,10 @@ func (s *symmetricState) Checkpoint() {
 	}
 	s.prevH = s.prevH[:len(s.h)]
 	copy(s.prevH, s.h)
+
+	s.prevK = s.k
+	s.prevN = s.n
+	s.prevHasK = s.hasK
 }
 
 func (s *symmetricState) Rollback() {
@@ -223,6 +230,15 @@ func (s *symmetricState) Rollback() {
 	copy(s.ck, s.prevCK)
 	s.h = s.h[:len(s.prevH)]
 	copy(s.h, s.prevH)
+
+	s.k = s.prevK
+	s.n = s.prevN
+	s.hasK = s.prevHasK
+	if s.hasK {
+		s.c = s.cs.Cipher(s.k)
+	} else {
+		s.c = nil
+	}
 }
 
 // A MessagePattern is a single message or operation used in a Noise handshake.
@@ -508,8 +524,29 @@ func (s *HandshakeState) ReadMessage(out, message []byte) ([]byte, *CipherState,
 		return nil, nil, nil, errors.New("noise: no handshake messages left")
 	}
 
-	rsSet := false
+	// Snapshot every piece of state this message may mutate so that any error
+	// path restores the HandshakeState to its state before the call: the
+	// symmetric state (ck, h, k, n, hasK), the remote static/ephemeral keys,
+	// the read/write turn and the message sequence number.
 	s.ss.Checkpoint()
+	prevRS := append([]byte(nil), s.rs...)
+	prevRE := append([]byte(nil), s.re...)
+	prevShouldWrite := s.shouldWrite
+	prevMsgIdx := s.msgIdx
+
+	rollback := func() {
+		s.ss.Rollback()
+		s.rs = prevRS
+		s.re = prevRE
+		s.shouldWrite = prevShouldWrite
+		s.msgIdx = prevMsgIdx
+	}
+	success := false
+	defer func() {
+		if !success {
+			rollback()
+		}
+	}()
 
 	var err error
 	for _, msg := range s.messagePatterns[s.msgIdx] {
@@ -537,14 +574,13 @@ func (s *HandshakeState) ReadMessage(out, message []byte) ([]byte, *CipherState,
 				if len(s.rs) > 0 {
 					return nil, nil, nil, errors.New("noise: invalid state, rs is not nil")
 				}
-				s.rs, err = s.ss.DecryptAndHash(s.rs[:0], message[:expected])
-				rsSet = true
+				var rs []byte
+				rs, err = s.ss.DecryptAndHash(make([]byte, 0, expected), message[:expected])
+				if err == nil {
+					s.rs = rs
+				}
 			}
 			if err != nil {
-				s.ss.Rollback()
-				if rsSet {
-					s.rs = nil
-				}
 				return nil, nil, nil, err
 			}
 			message = message[expected:]
@@ -594,14 +630,11 @@ func (s *HandshakeState) ReadMessage(out, message []byte) ([]byte, *CipherState,
 	}
 	out, err = s.ss.DecryptAndHash(out, message)
 	if err != nil {
-		s.ss.Rollback()
-		if rsSet {
-			s.rs = nil
-		}
 		return nil, nil, nil, err
 	}
 	s.shouldWrite = true
 	s.msgIdx++
+	success = true
 
 	if s.msgIdx >= len(s.messagePatterns) {
 		cs1, cs2 := s.ss.Split()
